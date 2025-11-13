@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -27,6 +28,24 @@ for offset in range(-12, 15):
     label = f"GMT{offset:+d}"
     TZINFOS[label] = tz
     TZINFOS[f"{label}:00"] = tz
+PLAYWRIGHT_MARKER = Path(".streamlit") / ".playwright_installed"
+
+
+def ensure_playwright_browser() -> None:
+    if PLAYWRIGHT_MARKER.exists():
+        return
+    try:
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        PLAYWRIGHT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        PLAYWRIGHT_MARKER.touch()
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Playwright browser install failed: {exc}")
 
 
 def _bool_from_secret(value, default: bool = True) -> bool:
@@ -192,6 +211,7 @@ def main():
         page_icon="📈",
         layout="wide",
     )
+    ensure_playwright_browser()
 
     st.title("LFPI Live Terminal")
     st.caption("Streamlit web UI powered by LiveTickerFinal23092025.")
