@@ -37,23 +37,34 @@ def ensure_playwright_browser() -> None:
         return
     if PLAYWRIGHT_MARKER.exists():
         return
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        PLAYWRIGHT_MARKER.parent.mkdir(parents=True, exist_ok=True)
-        PLAYWRIGHT_MARKER.touch()
-    except Exception as exc:  # noqa: BLE001
-        tracker.HAS_PLAYWRIGHT = False  # type: ignore[attr-defined]
-        msg = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
-        st.warning(
-            "Playwright browser install failed; Google/DOM data disabled for this session.\n"
-            f"Details: {msg}"
-        )
+
+    commands = [
+        [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+    ]
+    errors: list[str] = []
+    for cmd in commands:
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            PLAYWRIGHT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            PLAYWRIGHT_MARKER.touch()
+            return
+        except Exception as exc:  # noqa: BLE001
+            snippet = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
+            errors.append(f"{' '.join(cmd)} -> {snippet.strip()}")
+
+    tracker.HAS_PLAYWRIGHT = False  # type: ignore[attr-defined]
+    joined = "\n".join(errors[-2:])
+    st.warning(
+        "Playwright browser install failed; Google/DOM data disabled for this session.\n"
+        f"Details:\n{joined}"
+    )
 
 
 def _bool_from_secret(value, default: bool = True) -> bool:
