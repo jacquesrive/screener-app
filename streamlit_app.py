@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import sys
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -32,20 +33,27 @@ PLAYWRIGHT_MARKER = Path(".streamlit") / ".playwright_installed"
 
 
 def ensure_playwright_browser() -> None:
+    if not getattr(tracker, "HAS_PLAYWRIGHT", False):
+        return
     if PLAYWRIGHT_MARKER.exists():
         return
     try:
         subprocess.run(
-            ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
+            [sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"],
             check=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             text=True,
         )
         PLAYWRIGHT_MARKER.parent.mkdir(parents=True, exist_ok=True)
         PLAYWRIGHT_MARKER.touch()
     except Exception as exc:  # noqa: BLE001
-        st.warning(f"Playwright browser install failed: {exc}")
+        tracker.HAS_PLAYWRIGHT = False  # type: ignore[attr-defined]
+        msg = getattr(exc, "stderr", "") or getattr(exc, "output", "") or str(exc)
+        st.warning(
+            "Playwright browser install failed; Google/DOM data disabled for this session.\n"
+            f"Details: {msg}"
+        )
 
 
 def _bool_from_secret(value, default: bool = True) -> bool:
