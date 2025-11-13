@@ -9,15 +9,18 @@ import sys
 import tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 from uuid import uuid4
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from dateutil import parser as date_parser
 from zoneinfo import ZoneInfo, available_timezones
 
 import LiveTickerFinal23092025 as tracker
+
+FormatFunc = Callable[[float], str]
 
 BUNDLED_CSV_PATH = Path(__file__).with_name("websitelinks.csv")
 LOCAL_TZ = datetime.now().astimezone().tzinfo or timezone.utc
@@ -111,6 +114,29 @@ def _load_and_fetch(csv_path: str):
     return asyncio.run(tracker.gather_all_data())
 
 
+def _fmt(decimals: int, suffix: str = ""):
+    def inner(val):
+        if val is None or (isinstance(val, (int, float, np.floating)) and np.isnan(val)):
+            return ""
+        try:
+            return f"{float(val):.{decimals}f}{suffix}"
+        except Exception:
+            return suffix.strip()
+    return inner
+
+
+def _shade_change(val):
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if np.isnan(v) or abs(v) < 1e-12:
+        return ""
+    if v > 0:
+        return "background-color: rgba(25, 135, 84, 0.18); color: #0f5132; font-weight: 600;"
+    return "background-color: rgba(220, 53, 69, 0.18); color: #842029; font-weight: 600;"
+
+
 def _extract_dt_fragment(raw: str) -> str:
     text = str(raw or "").strip()
     if not text:
@@ -148,41 +174,64 @@ def _normalize_datetime(raw: str, target_tz: Optional[ZoneInfo]) -> Tuple[str, s
 
 def _format_equities(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Ticker", "Price", "Date", "Time", "Exchange", "Currency"])
+        return pd.DataFrame(columns=["Ticker", "Price", "Change", "Date", "Time", "Exchange", "Currency"])
     view = df.copy()
     view["PRICE"] = pd.to_numeric(view["PRICE"], errors="coerce").round(2)
+    if "CHANGE" not in view.columns:
+        view["CHANGE"] = np.nan
+    view["CHANGE"] = pd.to_numeric(view["CHANGE"], errors="coerce").round(2)
     date_time = view["DATE"].apply(lambda val: _normalize_datetime(val, target_tz))
     view["DATE"] = date_time.apply(lambda x: x[0])
     view["TIME"] = date_time.apply(lambda x: x[1])
-    view = view[["TICKER", "PRICE", "DATE", "TIME", "EXCHANGE", "CURRENCY"]]
-    view.columns = ["Ticker", "Price", "Date", "Time", "Exchange", "Currency"]
+    columns = ["TICKER", "PRICE", "CHANGE", "DATE", "TIME", "EXCHANGE", "CURRENCY"]
+    existing = [c for c in columns if c in view.columns]
+    view = view[existing]
+    view.columns = ["Ticker", "Price", "Change", "Date", "Time", "Exchange", "Currency"]
     return view
 
 
 def _format_forex(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Ticker", "Price", "Date", "Time"])
+        return pd.DataFrame(columns=["Ticker", "Price", "Change", "Date", "Time"])
     view = df.copy()
     view["PRICE"] = pd.to_numeric(view["PRICE"], errors="coerce").round(4)
+    if "CHANGE" not in view.columns:
+        view["CHANGE"] = np.nan
+    view["CHANGE"] = pd.to_numeric(view["CHANGE"], errors="coerce").round(2)
     date_time = view["DATE"].apply(lambda val: _normalize_datetime(val, target_tz))
     view["DATE"] = date_time.apply(lambda x: x[0])
     view["TIME"] = date_time.apply(lambda x: x[1])
-    view = view[["TICKER", "PRICE", "DATE", "TIME"]]
-    view.columns = ["Ticker", "Price", "Date", "Time"]
+    columns = ["TICKER", "PRICE", "CHANGE", "DATE", "TIME"]
+    existing = [c for c in columns if c in view.columns]
+    view = view[existing]
+    view.columns = ["Ticker", "Price", "Change", "Date", "Time"]
     return view
 
 
-def _render_table_section(title: str, df: pd.DataFrame, download_label: str, filename: str, price_format: str):
+def _render_table_section(title: str, df: pd.DataFrame, download_label: str, filename: str, numeric_formats: Optional[dict[str, FormatFunc]] = None):
     left, center, right = st.columns([1, 4, 1])
     with center:
         st.subheader(title)
+        formatter_mapping = {}
+        if numeric_formats:
+            for col, fmt in numeric_formats.items():
+                if col in df.columns:
+                    formatter_mapping[col] = fmt
+
+        use_styler = bool(formatter_mapping) or ("Change" in df.columns)
+        target = df
+        if use_styler:
+            styler = df.style
+            if formatter_mapping:
+                styler = styler.format(formatter_mapping)
+            if "Change" in df.columns:
+                styler = styler.applymap(_shade_change, subset=["Change"])
+            target = styler
+
         st.dataframe(
-            df,
+            target,
             hide_index=True,
             use_container_width=True,
-            column_config={
-                "Price": st.column_config.NumberColumn("Price", format=price_format),
-            },
         )
         st.download_button(
             download_label,
@@ -356,7 +405,7 @@ def main():
         equities_view,
         "Download equities CSV",
         "equities.csv",
-        "%.2f",
+        {"Price": _fmt(2), "Change": _fmt(2, "%")},
     )
 
     forex_view = _format_forex(latest_data["forex"], target_tz)
@@ -365,7 +414,7 @@ def main():
         forex_view,
         "Download forex CSV",
         "forex.csv",
-        "%.4f",
+        {"Price": _fmt(4), "Change": _fmt(2, "%")},
     )
 
     combined_simple = _combined_ticker_price(equities_view, forex_view)
