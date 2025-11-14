@@ -9,7 +9,7 @@
 # =========================================================
 
 import re, os, sys, time, asyncio, unicodedata, random, importlib, json
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -153,11 +153,41 @@ def split_date_meta(df: pd.DataFrame) -> pd.DataFrame:
     df["SOURCE"]   = df["SOURCE"].astype(str).str.replace(r"^\s*Source\s*:\s*", "", regex=True).str.strip()
     return df
 
-def _normalize_ticker_key(value: str) -> str:
+def _normalize_ticker_key(value: str | None) -> str:
     return (value or "").strip().upper()
 
+
+def _resolve_yahoo_symbol(
+    ticker: str | None,
+    exchange: str | None,
+    stock_exch: str | None,
+) -> str | None:
+    if not YAHOO_TICKERS:
+        return None
+    t_norm = _normalize_ticker_key(ticker)
+    exch_norm = _normalize_ticker_key(exchange)
+    stock_exch_norm = _normalize_ticker_key(stock_exch)
+    candidates = []
+    if t_norm:
+        candidates.append(t_norm)
+        if exch_norm:
+            candidates.append(f"{t_norm}:{exch_norm}")
+    if stock_exch_norm:
+        candidates.append(stock_exch_norm)
+    for cand in candidates:
+        sym = YAHOO_TICKERS.get(cand)
+        if sym:
+            return sym
+    return None
+
 def fetch_yahoo_previous_closes(symbols: List[str]) -> tuple[Dict[str, float], List[str]]:
-    unique = sorted({(s or "").strip() for s in symbols if (s or "").strip()})
+    seen: set[str] = set()
+    unique: List[str] = []
+    for sym in symbols:
+        cleaned = (sym or "").strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            unique.append(cleaned)
     out: Dict[str, float] = {}
     warnings: List[str] = []
     if not unique:
@@ -168,40 +198,18 @@ def fetch_yahoo_previous_closes(symbols: List[str]) -> tuple[Dict[str, float], L
         warnings.append(f"Yahoo Finance unavailable: {exc}")
         return out, warnings
 
-    def prev_close_from_history(hist: pd.DataFrame) -> float | None:
-        if hist is None or hist.empty or "Close" not in hist:
-            return None
-        closes = hist["Close"].dropna()
-        if len(closes) >= 2:
-            try:
-                return float(closes.iloc[-2])
-            except Exception:
-                return None
-        if len(closes) == 1:
-            try:
-                return float(closes.iloc[-1])
-            except Exception:
-                return None
-        return None
-
     for sym in unique:
         val = None
         try:
             ticker = yf.Ticker(sym)
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-            val = prev_close_from_history(hist)
-            if val is None:
-                fi = getattr(ticker, "fast_info", None)
-                if isinstance(fi, dict):
-                    for key in ("previous_close", "previousClose", "last_price", "lastPrice"):
-                        if fi.get(key) is not None:
-                            try:
-                                val = float(fi[key])
-                                break
-                            except Exception:
-                                continue
+            info = ticker.info
+            info_val = info.get("regularMarketPreviousClose") or info.get("previousClose")
+            if info_val is not None:
+                val = float(info_val)
+            else:
+                warnings.append(f"Yahoo info missing previous close for {sym}")
         except Exception as exc:
-            warnings.append(f"Yahoo lookup failed for {sym}: {exc}")
+            warnings.append(f"Yahoo info lookup failed for {sym}: {exc}")
             val = None
 
         if val is not None:
@@ -213,30 +221,31 @@ def fetch_yahoo_previous_closes(symbols: List[str]) -> tuple[Dict[str, float], L
 
 def attach_yahoo_change(equities_df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]]:
     if equities_df is None or equities_df.empty or not YAHOO_TICKERS:
-        equities_df = equities_df.copy()
+        equities_df = equities_df.copy() if equities_df is not None else pd.DataFrame()
         equities_df["Y_PREV_CLOSE"] = np.nan
         return equities_df, []
 
-    ticker_map: Dict[int, str] = {}
-    needed: List[str] = []
-    for idx, t in equities_df["TICKER"].items():
-        key = _normalize_ticker_key(t)
-        yahoo = YAHOO_TICKERS.get(key)
-        if yahoo:
-            ticker_map[idx] = yahoo
-            needed.append(yahoo)
+    equities_df = equities_df.copy()
+    yahoo_symbols: List[Optional[str]] = []
+    for _, row in equities_df.iterrows():
+        yahoo_symbols.append(
+            _resolve_yahoo_symbol(
+                row.get("TICKER"),
+                row.get("EXCHANGE"),
+                row.get("STOCK:EXCH"),
+            )
+        )
 
+    needed = [sym for sym in yahoo_symbols if sym]
     prev_map, warnings = fetch_yahoo_previous_closes(needed)
     prev_values = []
-    for idx in range(len(equities_df)):
-        yahoo = ticker_map.get(idx)
-        prev = prev_map.get(yahoo) if yahoo else None
+    for sym in yahoo_symbols:
+        prev = prev_map.get(sym) if sym else None
         try:
             prev_values.append(float(prev))
         except (TypeError, ValueError):
             prev_values.append(np.nan)
 
-    equities_df = equities_df.copy()
     equities_df["Y_PREV_CLOSE"] = prev_values
     return equities_df, warnings
 
@@ -274,6 +283,7 @@ def attach_forex_change(forex_df: pd.DataFrame) -> tuple[pd.DataFrame, List[str]
     prev = pd.to_numeric(forex_df["Y_PREV_CLOSE"], errors="coerce")
     with np.errstate(divide="ignore", invalid="ignore"):
         pct = (price - prev) / prev * 100.0
+    forex_df["PREV_CLOSE"] = prev
     forex_df["CHANGE"] = pct
     forex_df.drop(columns=["Y_PREV_CLOSE"], inplace=True, errors="ignore")
     return forex_df, warnings
@@ -372,12 +382,22 @@ def load_config_from_local_csv(path: str):
     yahoo_map: Dict[str, str] = {}
     if yahoo_col:
         for _, r in df.iterrows():
-            base = (r.get("ticker", "") or "").upper().strip()
-            alt = (r.get("symbol", "") or "").upper().strip()
             yahoo = (r.get(yahoo_col, "") or "").strip()
-            key = base or alt
-            if key and yahoo:
-                yahoo_map[key] = yahoo
+            if not yahoo:
+                continue
+            base = _normalize_ticker_key(r.get("ticker"))
+            alt = _normalize_ticker_key(r.get("symbol"))
+            exch = _normalize_ticker_key(r.get("zb_exchange"))
+            keys = []
+            if base:
+                keys.append(base)
+                if exch:
+                    keys.append(f"{base}:{exch}")
+            if alt:
+                keys.append(alt)
+            for key in keys:
+                if key:
+                    yahoo_map[key] = yahoo
     globals()["YAHOO_TICKERS"] = yahoo_map
 
     print(f"[CONFIG] Loaded -> Google={len(GOOGLE_SYMBOLS)} | Euronext={len(EURONEXT_BATCH)} | ZoneBourse={len(ZB_STOCKS)} | FX={len(FX_PAIRS)} | Yahoo={len(YAHOO_TICKERS)}")
@@ -1236,11 +1256,12 @@ async def gather_all_data():
         price = equities_combined["PRICE"]
         with np.errstate(divide="ignore", invalid="ignore"):
             pct = (price - prev_close) / prev_close * 100.0
+        equities_combined["PREV_CLOSE"] = prev_close
         equities_combined["CHANGE"] = pct
         equities_combined.drop(columns=["Y_PREV_CLOSE"], inplace=True, errors="ignore")
     warnings.extend(yahoo_warns)
 
-    desired_order = ["SOURCE","STOCK:EXCH","TICKER","PRICE","CHANGE","DATE","EXCHANGE","CURRENCY"]
+    desired_order = ["SOURCE","STOCK:EXCH","TICKER","PRICE","PREV_CLOSE","CHANGE","DATE","EXCHANGE","CURRENCY"]
     existing_order = [c for c in desired_order if c in equities_combined.columns]
     remaining_cols = [c for c in equities_combined.columns if c not in existing_order]
     equities_combined = equities_combined[existing_order + remaining_cols]
