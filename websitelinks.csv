@@ -6,14 +6,10 @@ euronext;MN:BIT;https://live.euronext.com/en/product/equities/IT0001469383-MTAA;
 euronext;VAC:PAR;https://live.euronext.com/en/product/equities/FR0000073041-XPAR;VAC;PAR;VAC.PA;https://finance.yahoo.com/quote/VAC.PA/
 google;DATA:LON;https://www.google.com/finance/quote/DATA:LON?hl=en;DATA;LON;DATA.L;https://finance.yahoo.com/quote/DATA.L/
 zonebourse;TATE:LON;https://www.zonebourse.com/cours/action/TATE-LYLE-PLC-4000590/;TATE;LON;TATE.L;https://finance.yahoo.com/quote/TATE.L/
-zonebourse;YCA:LON;https://www.zonebourse.com/cours/action/YELLOW-CAKE-PLC-44531623/;YCA;LON;YCA.L;https://finance.yahoo.com/quote/YCA.L/
 zonebourse;BP:LON;https://www.zonebourse.com/cours/action/BP-PLC-9590188/;BP;LON;BP.L;https://finance.yahoo.com/quote/BP.L/
-zonebourse;AAL:LON;https://www.zonebourse.com/cours/action/ANGLO-AMERICAN-PLC-4007113/;AAL;LON;AAL.L;https://finance.yahoo.com/quote/AAL.L/
 zonebourse;LSEG:LON;https://www.zonebourse.com/cours/action/LONDON-STOCK-EXCHANGE-GRO-4005918/;LSEG;LON;LSEG.L;https://finance.yahoo.com/quote/LSEG.L/
 zonebourse;META:NASDAQ;https://www.zonebourse.com/cours/action/META-PLATFORMS-INC-10547141/;META;NASDAQ;META;https://finance.yahoo.com/quote/META/
 zonebourse;WY:NYSE;https://www.zonebourse.com/cours/action/WEYERHAEUSER-COMPANY-14932/;WY;NYSE;WY;https://finance.yahoo.com/quote/WY/
-zonebourse;EBRO:BMI;https://www.zonebourse.com/cours/action/EBRO-FOODS-S-A-408703/;EBRO;BMI;EBRO.MC;https://finance.yahoo.com/quote/EBRO.MC/
-zonebourse;SWON:SIX;https://www.zonebourse.com/cours/action/SOFTWAREONE-HOLDING-AG-72370735/;SWON;SIX;SWON.SW;https://finance.yahoo.com/quote/SWON.SW/
 zonebourse;LAND:SIX;https://www.zonebourse.com/cours/action/LANDIS-GYR-GROUP-AG-37186614/;LAND;SIX;LAND.SW;https://finance.yahoo.com/quote/LAND.SW/
 fx;EURUSD;https://www.tradingview.com/symbols/EURUSD/?exchange=FX_IDC;EURUSD;USD;EURUSD=X;https://finance.yahoo.com/quote/EURUSD=X/
 fx;EURGBP;https://www.tradingview.com/symbols/EURGBP/?exchange=FX_IDC;EURGBP;GBP;EURGBP=X;https://finance.yahoo.com/quote/EURGBP=X/
