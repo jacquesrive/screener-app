@@ -7,9 +7,9 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from pathlib import Path
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Sequence
 from uuid import uuid4
 
 import numpy as np
@@ -17,6 +17,8 @@ import pandas as pd
 import streamlit as st
 from dateutil import parser as date_parser
 from zoneinfo import ZoneInfo, available_timezones
+
+import yfinance as yf
 
 import LiveTickerFinal23092025 as tracker
 
@@ -125,6 +127,128 @@ def _fmt(decimals: int, suffix: str = ""):
     return inner
 
 
+def _is_weekend(day: date) -> bool:
+    return day.weekday() >= 5
+
+
+def _previous_business_day(day: date) -> date:
+    current = day - timedelta(days=1)
+    while _is_weekend(current):
+        current -= timedelta(days=1)
+    return current
+
+
+def _closest_index_by_date(dates: Sequence[date], target: date) -> int:
+    if not dates:
+        return -1
+    for idx, day in enumerate(dates):
+        if day >= target:
+            return idx
+    return len(dates) - 1
+
+
+def _lookup_yahoo_symbol(row: pd.Series, raw_mapping: Optional[dict[str, str]] = None) -> Optional[str]:
+    yahoo_col_value = (row.get("YahooColumn") or "").strip()
+    if yahoo_col_value:
+        return yahoo_col_value
+    mapping = raw_mapping or getattr(tracker, "YAHOO_TICKERS", {})
+    if not mapping:
+        return None
+    ticker = (row.get("Ticker") or "").strip().upper()
+    exchange = (row.get("Exchange") or "").strip().upper()
+    alt = (row.get("SourceTicker") or "").strip().upper()
+    candidates = []
+    if ticker:
+        if exchange:
+            candidates.append(f"{ticker}:{exchange}")
+        candidates.append(ticker)
+    if alt:
+        candidates.append(alt)
+    for cand in candidates:
+        if not cand:
+            continue
+        if cand in mapping:
+            return mapping[cand]
+    return None
+
+
+def _lookup_forex_symbol(row: pd.Series) -> Optional[str]:
+    raw = (row.get("Ticker") or "").strip().upper()
+    if not raw:
+        return None
+    clean = re.sub(r"[^A-Z0-9]", "", raw)
+    if not clean:
+        return None
+    if not clean.endswith("=X"):
+        clean = f"{clean}=X"
+    return clean
+
+
+def _fetch_symbol_history(symbol: str, start: date, end: date) -> pd.DataFrame:
+    cache = st.session_state.setdefault("_symbol_history_cache", {})
+    key = (symbol, start.isoformat(), end.isoformat())
+    if key in cache:
+        return cache[key]
+    try:
+        hist = yf.download(
+            symbol,
+            start=(start - timedelta(days=2)).isoformat(),
+            end=(end + timedelta(days=2)).isoformat(),
+            interval="1d",
+            auto_adjust=False,
+            actions=False,
+            progress=False,
+            threads=False,
+            group_by="column",
+        )
+    except Exception:
+        hist = pd.DataFrame()
+    if not hist.empty:
+        close_col = None
+        for col in hist.columns:
+            name = ""
+            if isinstance(col, tuple):
+                for part in col:
+                    if str(part).strip().lower() == "close":
+                        close_col = col
+                        break
+                if close_col is not None:
+                    break
+            else:
+                name = str(col).strip().lower()
+                if name == "close":
+                    close_col = col
+                    break
+        if close_col is None:
+            flat_cols = ["_".join(str(part).strip() for part in (col if isinstance(col, tuple) else (col,)) if part).strip("_") for col in hist.columns]
+            hist.columns = flat_cols
+            if "Close" in hist.columns:
+                close_col = "Close"
+        if close_col is None:
+            cache[key] = pd.DataFrame()
+            return cache[key]
+        hist = hist[[close_col]].copy()
+        hist.columns = ["Close"]
+        hist = hist.dropna(subset=["Close"])
+        hist["DateOnly"] = hist.index.date
+    cache[key] = hist
+    return hist
+
+
+def _price_from_history(symbol: str, target: date, start: date, end: date) -> Optional[float]:
+    hist = _fetch_symbol_history(symbol, start, end)
+    if hist.empty:
+        return None
+    idx = _closest_index_by_date(list(hist["DateOnly"]), target)
+    if idx == -1:
+        return None
+    value = hist.iloc[idx]["Close"]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _shade_change(val):
     try:
         v = float(val)
@@ -185,7 +309,10 @@ def _format_equities(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.Data
     date_time = view["DATE"].apply(lambda val: _normalize_datetime(val, target_tz))
     view["DATE"] = date_time.apply(lambda x: x[0])
     view["TIME"] = date_time.apply(lambda x: x[1])
-    columns = ["TICKER", "PRICE", "PREV_CLOSE", "CHANGE", "DATE", "TIME", "EXCHANGE", "CURRENCY"]
+    view["SOURCE_TICKER"] = view.get("TICKER", "")
+    if "YAHOO TICKER" in view.columns:
+        view["YAHOO_TICKER_RAW"] = view["YAHOO TICKER"]
+    columns = ["TICKER", "PRICE", "PREV_CLOSE", "CHANGE", "DATE", "TIME", "EXCHANGE", "CURRENCY", "SOURCE_TICKER", "YAHOO_TICKER_RAW"]
     existing = [c for c in columns if c in view.columns]
     view = view[existing]
     rename_lookup = {
@@ -197,6 +324,8 @@ def _format_equities(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.Data
         "TIME": "Time",
         "EXCHANGE": "Exchange",
         "CURRENCY": "Currency",
+        "SOURCE_TICKER": "SourceTicker",
+        "YAHOO_TICKER_RAW": "YahooColumn",
     }
     view.columns = [rename_lookup.get(col, col) for col in existing]
     return view
@@ -230,6 +359,70 @@ def _format_forex(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.DataFra
     return view
 
 
+def _compute_period_performance(
+    df: pd.DataFrame,
+    start_date: date,
+    end_date: date,
+    symbol_resolver: Callable[[pd.Series], Optional[str]],
+) -> tuple[pd.DataFrame, list[str]]:
+    warnings: list[str] = []
+    if df is None or df.empty:
+        empty = df.copy() if df is not None else pd.DataFrame()
+        empty["Period Performance"] = np.nan
+        return empty, warnings
+
+    today = datetime.now().date()
+    prev_business = _previous_business_day(today)
+    hist_start = min(start_date, end_date, today) - timedelta(days=7)
+    hist_end = max(start_date, end_date, today) + timedelta(days=2)
+
+    df = df.copy()
+    df["PeriodSymbol"] = df.apply(symbol_resolver, axis=1)
+    performances: list[Optional[float]] = []
+
+    for _, row in df.iterrows():
+        symbol = row.get("PeriodSymbol")
+
+        def price_for(target: date) -> Optional[float]:
+            if target >= today:
+                val = row.get("Price")
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return None
+            if target == prev_business and pd.notna(row.get("Prev Close")):
+                try:
+                    return float(row.get("Prev Close"))
+                except (TypeError, ValueError):
+                    return None
+            if not symbol:
+                return None
+            return _price_from_history(symbol, target, hist_start, hist_end)
+
+        start_price = price_for(start_date)
+        end_price = price_for(end_date)
+
+        if symbol is None:
+            warnings.append(f"No Yahoo symbol mapping for {row.get('Ticker')}")
+        if start_price is None or end_price is None or not start_price:
+            performances.append(np.nan)
+            continue
+        try:
+            perf = (float(end_price) - float(start_price)) / float(start_price) * 100.0
+        except Exception:
+            perf = np.nan
+        performances.append(perf)
+
+    df["Period Performance"] = performances
+    ordered_cols = [col for col in df.columns if col not in {"Period Performance", "PeriodSymbol"}] + ["PeriodSymbol", "Period Performance"]
+    df = df[ordered_cols]
+    if warnings:
+        # Deduplicate to keep message concise
+        unique = list(dict.fromkeys(warnings))
+        warnings = unique
+    return df, warnings
+
+
 def _render_table_section(
     title: str,
     df: pd.DataFrame,
@@ -250,15 +443,17 @@ def _render_table_section(
                 if col in df.columns:
                     formatter_mapping[col] = fmt
 
-        display_df = df.drop(columns=["Prev Close"], errors="ignore")
+        hidden_cols = ["Prev Close", "SourceTicker", "YahooTicker", "YahooColumn", "PeriodSymbol"]
+        display_df = df.drop(columns=hidden_cols, errors="ignore")
         use_styler = bool(formatter_mapping) or ("Change" in display_df.columns)
         target = display_df
         if use_styler:
             styler = display_df.style
             if formatter_mapping:
                 styler = styler.format(formatter_mapping)
-            if "Change" in display_df.columns:
-                styler = styler.applymap(_shade_change, subset=["Change"])
+            shade_cols = [col for col in ("Change", "Period Performance") if col in display_df.columns]
+            if shade_cols:
+                styler = styler.applymap(_shade_change, subset=shade_cols)
             target = styler
 
         event = None
@@ -424,6 +619,9 @@ def main():
         csv_label = f"Uploaded file ({uploaded.name})"
         st.caption(f"Uploaded file stored temporarily at `{csv_path}`")
 
+    period_range_value: Tuple[date, date] | Tuple[date] | date | None = None
+    period_perf_enabled: bool = False
+    quick_range_label: str = ""
     control_left, control_center, control_right = st.columns([1, 4, 1])
     with control_center:
         tz_choice = st.selectbox(
@@ -438,12 +636,65 @@ def main():
         else:
             st.caption(f"Time column shown in source timezone (local detected: {LOCAL_TZ_KEY}).")
 
+        period_perf_enabled = st.toggle(
+            "Show period performance",
+            value=True,
+            help="Toggle custom date-range performance calculations sourced from Yahoo Finance history.",
+        )
+        today_date = datetime.now().date()
+        if period_perf_enabled:
+            quick_options = [
+                ("Past week", 7),
+                ("Past 2 weeks", 14),
+                ("Past 1 month", 30),
+                ("Past 3 months", 90),
+                ("Past 6 months", 180),
+                ("Past 9 months", 270),
+                ("Past 1 year", 365),
+                ("YTD", None),
+            ]
+            quick_choice = st.segmented_control(
+                "Quick ranges",
+                options=[label for label, _ in quick_options],
+                default="Past week",
+                help="Tap to quickly set the date range. YTD starts on the first trading day of the year.",
+            )
+            quick_range_label = quick_choice
+            default_start = today_date - timedelta(days=7)
+            if quick_choice == "YTD":
+                year_start = date(today_date.year, 1, 1)
+                while _is_weekend(year_start):
+                    year_start += timedelta(days=1)
+                default_start = year_start
+            else:
+                offset = dict(quick_options).get(quick_choice, 7)
+                default_start = today_date - timedelta(days=offset or 7)
+            period_range_value = st.date_input(
+                "Period performance range",
+                value=(default_start, today_date),
+                min_value=today_date - timedelta(days=365),
+                max_value=today_date,
+                help="Choose start and end dates for performance calculations. Weekends will use the nearest trading day automatically.",
+            )
+
         action_col1, action_col2 = st.columns(2)
         fetch_clicked = action_col1.button("Fetch / Refresh", type="primary", use_container_width=True)
         if action_col2.button("Clear results", use_container_width=True):
             for key in ("latest_data", "latest_updated", "latest_source"):
                 st.session_state.pop(key, None)
             st.info("Cleared previous results.")
+
+    period_start: Optional[date] = None
+    period_end: Optional[date] = None
+    if period_perf_enabled:
+        if isinstance(period_range_value, tuple) and len(period_range_value) == 2:
+            raw_start, raw_end = period_range_value
+            period_start = min(raw_start, raw_end)
+            period_end = max(raw_start, raw_end)
+        else:
+            today_fallback = datetime.now().date()
+            period_start = today_fallback - timedelta(days=5)
+            period_end = today_fallback
 
     if fetch_clicked and csv_path:
         try:
@@ -476,24 +727,60 @@ def main():
     metrics_col2.metric("Forex rows", latest_data.get("fx_count", 0))
 
     equities_view = _format_equities(latest_data["equities"], target_tz)
+    perf_warnings: list[str] = []
+    if period_perf_enabled and period_start and period_end:
+        st.session_state.pop("_symbol_history_cache", None)
+        mapping = getattr(tracker, "YAHOO_TICKERS", {})
+        equities_view, perf_warnings = _compute_period_performance(
+            equities_view,
+            period_start,
+            period_end,
+            lambda row: _lookup_yahoo_symbol(row, mapping),
+        )
+        if perf_warnings:
+            preview = ", ".join(perf_warnings[:5])
+            if len(perf_warnings) > 5:
+                preview += ", ..."
+            st.info(f"Period performance unavailable for: {preview}")
+    else:
+        equities_view = equities_view.drop(columns=["Period Performance", "PeriodSymbol"], errors="ignore")
+    eq_formats = {"Price": _fmt(2), "Change": _fmt(2, "%")}
+    if period_perf_enabled:
+        eq_formats["Period Performance"] = _fmt(2, "%")
     _render_table_section(
         "Equities",
         equities_view,
         "Download equities CSV",
         "equities.csv",
-        {"Price": _fmt(2), "Change": _fmt(2, "%")},
+        eq_formats,
         show_prev_close=True,
         table_key="equities_table",
         prev_close_formatter=_fmt(2),
     )
 
     forex_view = _format_forex(latest_data["forex"], target_tz)
+    fx_formats = {"Price": _fmt(4), "Change": _fmt(2, "%")}
+    if period_perf_enabled and period_start and period_end:
+        forex_view, fx_warnings = _compute_period_performance(
+            forex_view,
+            period_start,
+            period_end,
+            _lookup_forex_symbol,
+        )
+        if fx_warnings:
+            preview = ", ".join(fx_warnings[:5])
+            if len(fx_warnings) > 5:
+                preview += ", ..."
+            st.info(f"Forex period performance unavailable for: {preview}")
+        fx_formats["Period Performance"] = _fmt(2, "%")
+    else:
+        forex_view = forex_view.drop(columns=["Period Performance", "PeriodSymbol"], errors="ignore")
     _render_table_section(
         "Forex",
         forex_view,
         "Download forex CSV",
         "forex.csv",
-        {"Price": _fmt(4), "Change": _fmt(2, "%")},
+        fx_formats,
         show_prev_close=True,
         table_key="forex_table",
         prev_close_formatter=_fmt(4),
