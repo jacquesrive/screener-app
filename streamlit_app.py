@@ -174,41 +174,73 @@ def _normalize_datetime(raw: str, target_tz: Optional[ZoneInfo]) -> Tuple[str, s
 
 def _format_equities(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Ticker", "Price", "Change", "Date", "Time", "Exchange", "Currency"])
+        return pd.DataFrame(columns=["Ticker", "Price", "Prev Close", "Change", "Date", "Time", "Exchange", "Currency"])
     view = df.copy()
     view["PRICE"] = pd.to_numeric(view["PRICE"], errors="coerce").round(2)
     if "CHANGE" not in view.columns:
         view["CHANGE"] = np.nan
     view["CHANGE"] = pd.to_numeric(view["CHANGE"], errors="coerce").round(2)
+    if "PREV_CLOSE" in view.columns:
+        view["PREV_CLOSE"] = pd.to_numeric(view["PREV_CLOSE"], errors="coerce").round(2)
     date_time = view["DATE"].apply(lambda val: _normalize_datetime(val, target_tz))
     view["DATE"] = date_time.apply(lambda x: x[0])
     view["TIME"] = date_time.apply(lambda x: x[1])
-    columns = ["TICKER", "PRICE", "CHANGE", "DATE", "TIME", "EXCHANGE", "CURRENCY"]
+    columns = ["TICKER", "PRICE", "PREV_CLOSE", "CHANGE", "DATE", "TIME", "EXCHANGE", "CURRENCY"]
     existing = [c for c in columns if c in view.columns]
     view = view[existing]
-    view.columns = ["Ticker", "Price", "Change", "Date", "Time", "Exchange", "Currency"]
+    rename_lookup = {
+        "TICKER": "Ticker",
+        "PRICE": "Price",
+        "PREV_CLOSE": "Prev Close",
+        "CHANGE": "Change",
+        "DATE": "Date",
+        "TIME": "Time",
+        "EXCHANGE": "Exchange",
+        "CURRENCY": "Currency",
+    }
+    view.columns = [rename_lookup.get(col, col) for col in existing]
     return view
 
 
 def _format_forex(df: pd.DataFrame, target_tz: Optional[ZoneInfo]) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Ticker", "Price", "Change", "Date", "Time"])
+        return pd.DataFrame(columns=["Ticker", "Price", "Prev Close", "Change", "Date", "Time"])
     view = df.copy()
     view["PRICE"] = pd.to_numeric(view["PRICE"], errors="coerce").round(4)
     if "CHANGE" not in view.columns:
         view["CHANGE"] = np.nan
     view["CHANGE"] = pd.to_numeric(view["CHANGE"], errors="coerce").round(2)
+    if "PREV_CLOSE" in view.columns:
+        view["PREV_CLOSE"] = pd.to_numeric(view["PREV_CLOSE"], errors="coerce").round(4)
     date_time = view["DATE"].apply(lambda val: _normalize_datetime(val, target_tz))
     view["DATE"] = date_time.apply(lambda x: x[0])
     view["TIME"] = date_time.apply(lambda x: x[1])
-    columns = ["TICKER", "PRICE", "CHANGE", "DATE", "TIME"]
+    columns = ["TICKER", "PRICE", "PREV_CLOSE", "CHANGE", "DATE", "TIME"]
     existing = [c for c in columns if c in view.columns]
     view = view[existing]
-    view.columns = ["Ticker", "Price", "Change", "Date", "Time"]
+    rename_lookup = {
+        "TICKER": "Ticker",
+        "PRICE": "Price",
+        "PREV_CLOSE": "Prev Close",
+        "CHANGE": "Change",
+        "DATE": "Date",
+        "TIME": "Time",
+    }
+    view.columns = [rename_lookup.get(col, col) for col in existing]
     return view
 
 
-def _render_table_section(title: str, df: pd.DataFrame, download_label: str, filename: str, numeric_formats: Optional[dict[str, FormatFunc]] = None):
+def _render_table_section(
+    title: str,
+    df: pd.DataFrame,
+    download_label: str,
+    filename: str,
+    numeric_formats: Optional[dict[str, FormatFunc]] = None,
+    *,
+    show_prev_close: bool = False,
+    table_key: Optional[str] = None,
+    prev_close_formatter: Optional[FormatFunc] = None,
+):
     left, center, right = st.columns([1, 4, 1])
     with center:
         st.subheader(title)
@@ -218,21 +250,33 @@ def _render_table_section(title: str, df: pd.DataFrame, download_label: str, fil
                 if col in df.columns:
                     formatter_mapping[col] = fmt
 
-        use_styler = bool(formatter_mapping) or ("Change" in df.columns)
-        target = df
+        display_df = df.drop(columns=["Prev Close"], errors="ignore")
+        use_styler = bool(formatter_mapping) or ("Change" in display_df.columns)
+        target = display_df
         if use_styler:
-            styler = df.style
+            styler = display_df.style
             if formatter_mapping:
                 styler = styler.format(formatter_mapping)
-            if "Change" in df.columns:
+            if "Change" in display_df.columns:
                 styler = styler.applymap(_shade_change, subset=["Change"])
             target = styler
 
-        st.dataframe(
-            target,
-            hide_index=True,
-            use_container_width=True,
-        )
+        event = None
+        dataframe_kwargs = dict(hide_index=True, use_container_width=True)
+        if show_prev_close:
+            df_key = table_key or f"{re.sub(r'\\W+', '_', title.lower()).strip('_')}_table"
+            event = st.dataframe(
+                target,
+                key=df_key,
+                on_select="rerun",
+                selection_mode="single-cell",
+                **dataframe_kwargs,
+            )
+        else:
+            st.dataframe(
+                target,
+                **dataframe_kwargs,
+            )
         st.download_button(
             download_label,
             df.to_csv(index=False).encode("utf-8"),
@@ -240,6 +284,24 @@ def _render_table_section(title: str, df: pd.DataFrame, download_label: str, fil
             mime="text/csv",
             use_container_width=True,
         )
+        if show_prev_close and event is not None and "Prev Close" in df.columns:
+            selection = getattr(event, "selection", None)
+            cells = None
+            if selection is not None:
+                cells = getattr(selection, "cells", None)
+                if not cells and hasattr(selection, "get"):
+                    cells = selection.get("cells")
+            if cells:
+                row_idx, col_name = cells[-1]
+                if col_name == "Change" and 0 <= row_idx < len(df):
+                    row = df.iloc[row_idx]
+                    prev_val = row.get("Prev Close")
+                    ticker = row.get("Ticker", "")
+                    fmt_func = prev_close_formatter or _fmt(2)
+                    if pd.notna(prev_val):
+                        st.info(f"{ticker or 'Selected row'} previous close: {fmt_func(prev_val)}")
+                    else:
+                        st.warning(f"{ticker or 'Selected row'} previous close unavailable.")
 
 
 def _combined_ticker_price(eq_df: pd.DataFrame, fx_df: pd.DataFrame) -> pd.DataFrame:
@@ -406,6 +468,9 @@ def main():
         "Download equities CSV",
         "equities.csv",
         {"Price": _fmt(2), "Change": _fmt(2, "%")},
+        show_prev_close=True,
+        table_key="equities_table",
+        prev_close_formatter=_fmt(2),
     )
 
     forex_view = _format_forex(latest_data["forex"], target_tz)
@@ -415,6 +480,9 @@ def main():
         "Download forex CSV",
         "forex.csv",
         {"Price": _fmt(4), "Change": _fmt(2, "%")},
+        show_prev_close=True,
+        table_key="forex_table",
+        prev_close_formatter=_fmt(4),
     )
 
     combined_simple = _combined_ticker_price(equities_view, forex_view)
