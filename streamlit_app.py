@@ -382,11 +382,25 @@ def main():
     if not password_gate():
         st.stop()
 
-    csv_choice = st.radio(
-        "Configuration source",
-        options=("Bundled CSV", "Upload CSV"),
-        horizontal=True,
-    )
+    csv_choice_col_left, csv_choice_col_right = st.columns([2, 1])
+    with csv_choice_col_left:
+        csv_choice = st.radio(
+            "Configuration source",
+            options=("Bundled CSV", "Upload CSV"),
+            horizontal=True,
+        )
+    with csv_choice_col_right:
+        if BUNDLED_CSV_PATH.exists():
+            st.download_button(
+                "Download bundled CSV",
+                BUNDLED_CSV_PATH.read_bytes(),
+                file_name=BUNDLED_CSV_PATH.name,
+                mime="text/csv",
+                key="bundled_csv_download",
+                use_container_width=True,
+            )
+        else:
+            st.error(f"Bundled CSV not found at {BUNDLED_CSV_PATH}")
 
     csv_path: Optional[str] = None
     csv_label = ""
